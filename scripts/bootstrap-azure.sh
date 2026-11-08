@@ -38,16 +38,25 @@ if [[ -z "$SP_ID" ]]; then
   SP_ID="$(az ad sp create --id "$CLIENT_ID" --query id -o tsv)"
 fi
 
-SUBJECT="repo:${REPO}:ref:refs/heads/main"
+# GitHub can include numeric owner and repo IDs in the subject, so ask it for
+# the exact prefix instead of building one from the repository name.
+SUB_PREFIX="$(gh api "repos/${REPO}/actions/oidc/customization/sub" --jq .sub_claim_prefix)"
+: "${SUB_PREFIX:?could not read the OIDC subject prefix for $REPO from GitHub}"
+SUBJECT="${SUB_PREFIX}:ref:refs/heads/main"
+CRED_NAME="github-main"
+CRED_PARAMS="{
+  \"name\": \"${CRED_NAME}\",
+  \"issuer\": \"https://token.actions.githubusercontent.com\",
+  \"subject\": \"${SUBJECT}\",
+  \"audiences\": [\"api://AzureADTokenExchange\"]
+}"
 EXISTING="$(az ad app federated-credential list --id "$CLIENT_ID" \
-  --query "[?subject=='${SUBJECT}'] | length(@)" -o tsv)"
+  --query "[?name=='${CRED_NAME}'] | length(@)" -o tsv)"
 if [[ "$EXISTING" == "0" ]]; then
-  az ad app federated-credential create --id "$CLIENT_ID" -o none --parameters "{
-    \"name\": \"github-main\",
-    \"issuer\": \"https://token.actions.githubusercontent.com\",
-    \"subject\": \"${SUBJECT}\",
-    \"audiences\": [\"api://AzureADTokenExchange\"]
-  }"
+  az ad app federated-credential create --id "$CLIENT_ID" -o none --parameters "$CRED_PARAMS"
+else
+  az ad app federated-credential update --id "$CLIENT_ID" -o none \
+    --federated-credential-id "$CRED_NAME" --parameters "$CRED_PARAMS"
 fi
 
 echo "==> Granting access (app resource group and state storage only)"
