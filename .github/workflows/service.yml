@@ -1,0 +1,97 @@
+name: service
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Start (or update) the service, or stop it
+        type: choice
+        required: true
+        default: start
+        options: [start, stop]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: github.event_name == 'push' || inputs.action == 'start'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.name.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Work out image name
+        id: name
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: docker build -t "${{ steps.name.outputs.image }}" app
+
+      - name: Smoke test
+        run: |
+          docker run -d --name smoke -p 8080:8080 "${{ steps.name.outputs.image }}"
+          curl --fail --silent --show-error --retry 10 --retry-delay 1 --retry-connrefused http://localhost:8080/healthz
+          curl --fail --silent --show-error http://localhost:8080/ > /dev/null
+          docker rm -f smoke
+
+      - name: Push
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "${{ steps.name.outputs.image }}"
+
+  terraform:
+    needs: build
+    # Runs after a successful build on start, and with build skipped on stop.
+    if: >-
+      !cancelled() && github.event_name == 'workflow_dispatch' &&
+      needs.build.result != 'failure'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: terraform
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      ARM_USE_OIDC: "true"
+      ARM_USE_AZUREAD: "true"
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.13.*"
+          terraform_wrapper: false
+
+      - name: Init
+        run: |
+          terraform init -input=false \
+            -backend-config="resource_group_name=rg-webserver-tfstate" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=webserver.tfstate"
+
+      - name: Apply
+        env:
+          TF_VAR_running: ${{ inputs.action == 'start' }}
+          TF_VAR_image: ${{ needs.build.outputs.image }}
+        run: terraform apply -auto-approve -input=false
+
+      - name: Report URL
+        run: |
+          echo "Service URL: $(terraform output -raw url)" | tee -a "$GITHUB_STEP_SUMMARY"
